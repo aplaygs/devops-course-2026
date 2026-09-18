@@ -12,3 +12,6 @@
 - Git / GitHub / Multi-Remote
 - Python 3
 - Docker / CI/CD (планируется)
+
+## Multi-remote test
+Синхронизация между основным репозиторием и зеркалом настроена успешно.
