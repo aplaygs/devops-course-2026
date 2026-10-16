@@ -1,6 +1,6 @@
 # Конфигурация виртуальной машины devops-vm
 
-Документ описывает итоговое состояние сервера после ПР № 5 и порядок его восстановления со снимка `01-clean-install`. Используется как исходные данные для Ansible-роли в ПР № 11.
+Документ описывает итоговое состояние сервера после ПР № 5 и № 6 и порядок его восстановления со снимка `01-clean-install`. Используется как исходные данные для Ansible-роли в ПР № 11.
 
 Обозначения: **[Хост]** — команда в терминале macOS, **[VM]** — команда на сервере.
 
@@ -106,10 +106,70 @@ Host devops
 | `01-clean-install` | 2026-10-12 17:50 | система сразу после установки |
 | `02-keys-configured` | 2026-10-12 18:01 | пользователь `devops`, вход по ключу, `~/.ssh/config` |
 | `03-ssh-hardened` | 2026-10-12 18:02 | hardening SSH, порт 2222 |
+| `04-nginx-https` | 2026-10-16 11:53 | Nginx, HTTPS с самоподписанным сертификатом, ресурс доставлен rsync |
 
 Список: `prlctl snapshot-list devops-vm`; откат: `prlctl snapshot-switch devops-vm -i <ID>`.
 
 Имя узла: `hostname -f` → `devops-vm.devops.local` (строка `127.0.1.1 devops-vm.devops.local devops-vm` в `/etc/hosts` сервера). На хосте в `/etc/hosts`: `10.37.129.4   devops.local`.
+
+## 8. Веб-сервер
+
+| Параметр | Значение |
+|---|---|
+| Пакет | `nginx` (1.24.0, репозиторий Ubuntu), служба `nginx.service` включена в автозапуск; на сервере также установлен `rsync` |
+| Процессы | главный — `root` (читает конфигурацию и ключ, открывает порты 80/443), рабочие — `www-data` |
+| Конфигурация ресурса | `/etc/nginx/sites-available/devops-site` (root:root, 644), ссылка в `/etc/nginx/sites-enabled/devops-site` |
+| Стандартный ресурс | отключён: удалена ссылка `/etc/nginx/sites-enabled/default`, файл в `sites-available` сохранён |
+| Каталог ресурса | `/var/www/devops-site`, владелец `devops:devops`, каталоги `755`, файлы `644`; запись для `www-data` невозможна |
+| Журналы | `/var/log/nginx/devops-site.access.log`, `/var/log/nginx/devops-site.error.log`; перенаправления 301 (блок порта 80) — в общий `/var/log/nginx/access.log` |
+| Сертификат | `/etc/ssl/certs/devops.crt`, root:root, `644`; самоподписанный, CN и SAN `DNS:devops.local`, RSA 2048, срок 365 дней (до 16.10.2027) |
+| Закрытый ключ | `/etc/ssl/private/devops.key`, root:root, `600` (каталог `/etc/ssl/private` — 700); в репозиторий не добавляется |
+| Протоколы | `TLSv1.2 TLSv1.3`; HSTS **не** используется |
+| Доставка содержимого | `scripts/deploy.sh` из каталога `site/` репозитория (rsync `--delete --chmod=D755,F644`) |
+
+Порт 80 отвечает `301` с переходом на `https://$host$request_uri`; порт 443 обслуживает каталог ресурса, страница ошибки — `/404.html`. Правила UFW для 80/443 — из раздела 6 (профили `Nginx Full` и т. п. не добавляются).
+
+Формирование сертификата:
+
+```bash
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/ssl/private/devops.key -out /etc/ssl/certs/devops.crt \
+  -subj "/CN=devops.local" -addext "subjectAltName=DNS:devops.local"
+```
+
+Конфигурация `/etc/nginx/sites-available/devops-site`:
+
+```nginx
+server {
+    listen 80;
+    listen [::]:80;
+    server_name devops.local;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name devops.local;
+    ssl_certificate     /etc/ssl/certs/devops.crt;
+    ssl_certificate_key /etc/ssl/private/devops.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    root /var/www/devops-site;
+    index index.html;
+    location / {
+        try_files $uri $uri/ =404;
+    }
+    error_page 404 /404.html;
+    access_log /var/log/nginx/devops-site.access.log;
+    error_log  /var/log/nginx/devops-site.error.log;
+}
+```
+
+Изменения применяются только командой `sudo nginx -t && sudo systemctl reload nginx` (не `restart`).
+
+Хостовая система: сертификат для проверки клиентом — `~/devops.crt` (`scp devops:/etc/ssl/certs/devops.crt ~/devops.crt`). На macOS 15+ `/usr/bin/rsync` — это `openrsync`, не поддерживающий `--chmod`; нужен `brew install rsync` (`/opt/homebrew/bin/rsync` раньше в `PATH`).
+
+Особенности стенда: после возобновления приостановленной VM часы гостя отстают, и `apt` отклоняет индексы репозиториев (`Release file ... is not valid yet`) — синхронизировать время: `[Хост] ssh devops "sudo date -s @$(date +%s)"`.
 
 ---
 
@@ -156,4 +216,23 @@ sudo sed -i 's/^127.0.1.1.*/127.0.1.1 devops-vm.devops.local devops-vm/' /etc/ho
 prlsrvctl net set Shared --nat-tcp-del ssh; prlsrvctl net set Shared --nat-tcp-add ssh,2222,devops-vm,2222
 ssh devops 'hostname -f'
 scp -P 2222 -i ~/.ssh/devops_vm scripts/audit.sh devops@127.0.0.1:~ && ssh -t devops 'bash ~/audit.sh'   # код возврата 0
+```
+
+### Восстановление веб-сервера (после шагов 1–6)
+
+```bash
+# [VM]
+sudo apt update && sudo apt install -y nginx rsync
+sudo install -d -o devops -g devops -m 755 /var/www/devops-site
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/ssl/private/devops.key -out /etc/ssl/certs/devops.crt \
+  -subj "/CN=devops.local" -addext "subjectAltName=DNS:devops.local"
+sudo nano /etc/nginx/sites-available/devops-site       # текст конфигурации — раздел 8
+sudo ln -s /etc/nginx/sites-available/devops-site /etc/nginx/sites-enabled/
+sudo rm /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl reload nginx
+
+# [Хост] сертификат для клиента (сформирован заново — старый ~/devops.crt не подходит) и доставка
+scp devops:/etc/ssl/certs/devops.crt ~/devops.crt
+scripts/deploy.sh                                       # код возврата 0
 ```
