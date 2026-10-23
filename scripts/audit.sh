@@ -55,5 +55,15 @@ check "В $SITE_DIR нет файлов, доступных для записи 
       "$(find "$SITE_DIR" -perm -o+w | tr '\n' ' ' | sed 's/ $//')"
 check "Права закрытого ключа TLS — 600" "600" "$(sudo stat -c '%a' "$KEY")"
 
+echo "[5] Контейнеризация"
+APP_DIR="${APP_DIR:-$HOME/app}"
+
+check "Служба docker активна" "active" "$(systemctl is-active docker)"
+check "Контейнер СУБД app-db-1 в состоянии healthy" "healthy" \
+      "$(docker inspect -f '{{.State.Health.Status}}' app-db-1 2>/dev/null || echo absent)"
+check "Порты 5000 и 5432 прослушиваются только на 127.0.0.1" "" \
+      "$(ss -tln | awk '$4 ~ /:(5000|5432)$/ && $4 !~ /^127\.0\.0\.1:/ {print $4}' | tr '\n' ' ' | sed 's/ $//')"
+check "Права файла $APP_DIR/.env — 600" "600" "$(stat -c '%a' "$APP_DIR/.env" 2>/dev/null || echo absent)"
+
 echo "Пройдено: $PASS, не пройдено: $FAIL"
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1

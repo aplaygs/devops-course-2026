@@ -1,6 +1,6 @@
 # Конфигурация виртуальной машины devops-vm
 
-Документ описывает итоговое состояние сервера после ПР № 5 и № 6 и порядок его восстановления со снимка `01-clean-install`. Используется как исходные данные для Ansible-роли в ПР № 11.
+Документ описывает итоговое состояние сервера после ПР № 5–7 и порядок его восстановления со снимка `01-clean-install`. Используется как исходные данные для Ansible-роли в ПР № 11.
 
 Обозначения: **[Хост]** — команда в терминале macOS, **[VM]** — команда на сервере.
 
@@ -107,6 +107,7 @@ Host devops
 | `02-keys-configured` | 2026-10-12 18:01 | пользователь `devops`, вход по ключу, `~/.ssh/config` |
 | `03-ssh-hardened` | 2026-10-12 18:02 | hardening SSH, порт 2222 |
 | `04-nginx-https` | 2026-10-16 11:53 | Nginx, HTTPS с самоподписанным сертификатом, ресурс доставлен rsync |
+| `05-docker-compose` | 2026-10-23 12:05 | Docker Engine, проект `~/app` (Flask + PostgreSQL) в Compose |
 
 Список: `prlctl snapshot-list devops-vm`; откат: `prlctl snapshot-switch devops-vm -i <ID>`.
 
@@ -170,6 +171,36 @@ server {
 Хостовая система: сертификат для проверки клиентом — `~/devops.crt` (`scp devops:/etc/ssl/certs/devops.crt ~/devops.crt`). На macOS 15+ `/usr/bin/rsync` — это `openrsync`, не поддерживающий `--chmod`; нужен `brew install rsync` (`/opt/homebrew/bin/rsync` раньше в `PATH`).
 
 Особенности стенда: после возобновления приостановленной VM часы гостя отстают, и `apt` отклоняет индексы репозиториев (`Release file ... is not valid yet`) — синхронизировать время: `[Хост] ssh devops "sudo date -s @$(date +%s)"`.
+
+## 9. Контейнеризация
+
+| Параметр | Значение |
+|---|---|
+| Docker Engine | 29.9.2 (`docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin`, `docker-compose-plugin`) из официального репозитория `https://download.docker.com/linux/ubuntu` (noble, arm64); пакет `docker.io` не используется |
+| Docker Compose | плагин v5.6.1 (`docker compose`) |
+| Группа `docker` | только `devops` (у неё есть `sudo`; участник группы фактически имеет права root) |
+| Проект на сервере | `/home/devops/app` (доставляется из каталога `app/` репозитория: `rsync -avz --delete --exclude=.env app/ devops:app/`); имя проекта Compose — `app` |
+| Образ приложения | `devops-app:1.0` (`python:3.12-slim`, пользователь `app` uid 999, `gunicorn` на `0.0.0.0:5000` внутри контейнера) |
+| Сервисы | `app` (контейнер `app-app-1`), `db` — `postgres:16-alpine` (контейнер `app-db-1`, healthcheck `pg_isready`); `restart: unless-stopped`; `app` стартует после `db` в состоянии `healthy` |
+| Файл `.env` | `/home/devops/app/.env`, владелец `devops`, права `600`; создаётся только на сервере из `.env.example`, пароль — `openssl rand -hex 16`; в репозитории и образе отсутствует (`.gitignore`, `.dockerignore`) |
+| Публикуемые порты | `127.0.0.1:5000 → app:5000`; порт 5432 не публикуется (СУБД доступна только в сети проекта) |
+| Сеть | пользовательская bridge-сеть `app_backend`; приложение обращается к СУБД по имени `db` |
+| Том | именованный `app_db_data` → `/var/lib/postgresql/data` (сохраняется при `docker compose down`, удаляется только `down -v`) |
+| Обратный прокси-сервер | `location /app/` в HTTPS-блоке `/etc/nginx/sites-available/devops-site` → `proxy_pass http://127.0.0.1:5000/` |
+
+Фрагмент конфигурации Nginx (в блоке `server` для порта 443, перед `error_page`):
+
+```nginx
+    location /app/ {
+        proxy_pass http://127.0.0.1:5000/;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+```
+
+Публикация порта на `0.0.0.0` (например, `"5000:5000"`) обходит UFW: Docker добавляет правила DNAT в собственные цепочки iptables, которые срабатывают раньше правил UFW. Поэтому порты контейнеров публикуются только на `127.0.0.1`.
 
 ---
 
@@ -235,4 +266,28 @@ sudo nginx -t && sudo systemctl reload nginx
 # [Хост] сертификат для клиента (сформирован заново — старый ~/devops.crt не подходит) и доставка
 scp devops:/etc/ssl/certs/devops.crt ~/devops.crt
 scripts/deploy.sh                                       # код возврата 0
+```
+
+### Восстановление контейнеризации (после восстановления веб-сервера)
+
+```bash
+# [VM] Docker Engine из официального репозитория
+sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list
+sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker devops            # затем выйти и войти по SSH заново
+
+# [Хост] доставка проекта
+rsync -avz --delete --exclude=.env app/ devops:app/
+
+# [VM] секреты и запуск
+cd ~/app && cp .env.example .env && chmod 600 .env
+sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 16)/" .env
+docker compose up -d --build && docker compose ps     # db — (healthy)
+
+# [VM] обратный прокси: добавить location /app/ из раздела 9, затем
+sudo nginx -t && sudo systemctl reload nginx
 ```
