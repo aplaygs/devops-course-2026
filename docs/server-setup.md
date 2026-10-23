@@ -107,7 +107,7 @@ Host devops
 | `02-keys-configured` | 2026-10-12 18:01 | пользователь `devops`, вход по ключу, `~/.ssh/config` |
 | `03-ssh-hardened` | 2026-10-12 18:02 | hardening SSH, порт 2222 |
 | `04-nginx-https` | 2026-10-16 11:53 | Nginx, HTTPS с самоподписанным сертификатом, ресурс доставлен rsync |
-| `05-docker-compose` | 2026-10-23 12:06 | Docker Engine, проект `~/app` (Flask + PostgreSQL) в Compose |
+| `05-docker-compose` | 2026-10-23 12:05 | Docker Engine, проект `~/app` (Flask + PostgreSQL) в Compose |
 
 Список: `prlctl snapshot-list devops-vm`; откат: `prlctl snapshot-switch devops-vm -i <ID>`.
 
